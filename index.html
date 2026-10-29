@@ -1,0 +1,924 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1"
+  />
+  <meta name="theme-color" content="#171321" />
+  <meta name="screen-orientation" content="landscape" />
+  <meta name="x5-orientation" content="landscape" />
+  <meta
+    name="description"
+    content="勇者奶蛙传修改版：点开即玩，手机也能用。"
+  />
+  <title>勇者奶蛙传 · 修改版</title>
+  <base href="https://h5.metaapp.cn/online/h5/BUsvkkbBiAq2pF2Ttx4j/1.0.2/6/" />
+  <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" crossorigin href="./assets/game-DhG0Y0Ys.css" />
+</head>
+<body>
+  <main id="app"></main>
+
+  <!-- 游戏本体：从官方 CDN 按原样加载，资源通过 <base> 解析到官方目录 -->
+  <script type="module" crossorigin src="./assets/game-BDvRcsxG.js"></script>
+
+  <!-- 修改器：内联，避免依赖额外域名或安装扩展 -->
+  <script>
+// ==UserScript==
+// @name         勇者奶蛙传 · 奶蛙修改器
+// @namespace    https://h5.metaapp.cn/
+// @version      1.2.0
+// @description  无敌、一击必杀、无限能量、无限冲刺、黄桃自由、自动开火、清屏、跳关
+// @author       naiwa-trainer
+// @match        https://h5.metaapp.cn/online/h5/BUsvkkbBiAq2pF2Ttx4j/*
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const TAG = '[奶蛙修改器]';
+  const STORAGE_KEY = 'naiwa-trainer-v1';
+  const SAVE_PREFIX = 'naiwa:233-story:';
+  const RUN_SAVE_KEY = 'naiwa-run-v1';
+  const RUN_SAVE_FULL = SAVE_PREFIX + RUN_SAVE_KEY;
+  const MAX_ZONE = 6;
+
+  if (window.__NAIWA_TRAINER__) {
+    try { window.__NAIWA_TRAINER__.show(); } catch (e) {}
+    return;
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 配置
+   * ------------------------------------------------------------------ */
+
+  const DEFAULTS = {
+    god: false,          // 无敌
+    oneHit: false,       // 一击必杀
+    energy: false,       // 无限能量
+    autoAttack: false,   // 自动开火
+    dash: false,         // 无限冲刺
+    peaches: false,      // 黄桃自由
+    speed: false,        // 移动加速
+    superCharge: false,  // 超级大笑充能
+    panel: true,         // 面板展开
+    x: null,
+    y: null
+  };
+
+  let cfg = { ...DEFAULTS };
+  let hasSavedCfg = false;
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    hasSavedCfg = !!raw;
+    cfg = Object.assign(cfg, JSON.parse(raw || '{}'));
+  } catch (e) {}
+
+  // 手机首次打开默认收起面板，避免挡住游戏左侧摇杆/移动区
+  const isTouchLayout = (() => {
+    try {
+      return window.matchMedia('(pointer: coarse)').matches ||
+        Math.min(window.innerWidth, window.innerHeight) < 560;
+    } catch (e) { return false; }
+  })();
+  if (!hasSavedCfg && isTouchLayout) cfg.panel = false;
+
+  const saveCfg = () => {
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg)); } catch (e) {}
+  };
+
+  const TOGGLES = [
+    ['god',         '无敌模式',   '不受到任何伤害，站撸一切'],
+    ['oneHit',      '一击必杀',   '所有伤害 ×9999，碰一下就倒'],
+    ['energy',      '无限能量',   '大笑能量常驻 100%'],
+    ['autoAttack',  '自动开火',   '自动锁定最近敌人并持续发射奶球'],
+    ['dash',        '无限冲刺',   '冲刺次数与冷却常满'],
+    ['peaches',     '黄桃自由',   '黄桃罐头保持 99 个'],
+    ['speed',       '移动加速',   '移动速度 ×2'],
+    ['superCharge', '超级大笑',   '终章大招瞬间充满']
+  ];
+
+  const PHASE_TEXT = {
+    title: '标题界面',
+    playing: '战斗中',
+    transition: '过场中',
+    upgrade: '选择升级',
+    rescue: '营救公主',
+    defeat: '倒下了',
+    won: '已通关'
+  };
+
+  /* ------------------------------------------------------------------ *
+   * 游戏挂钩
+   * ------------------------------------------------------------------ */
+
+  let Model = null;
+  let model = null;
+  let hooked = false;
+  let hookError = '';
+  let hookPromise = null;
+  let clearGameSave = null;
+  let origHurt = null;
+  let origDamage = null;
+  let origSetMove = null;
+
+  const getModel = () => model || window.__naiwaModel || null;
+
+  function findModuleUrl() {
+    const tag = document.querySelector('script[src*="/assets/game-"]');
+    if (tag && tag.src) return tag.src;
+    try {
+      const hit = performance.getEntriesByType('resource')
+        .map(e => e.name)
+        .find(n => /\/assets\/game-[^/]+\.js$/.test(n));
+      if (hit) return hit;
+    } catch (e) {}
+    return null;
+  }
+
+  function install() {
+    if (!Model || Model.__naiwaInstalled) return;
+    Model.__naiwaInstalled = true;
+
+    const P = Model.prototype;
+
+    // 无敌：直接拦截英雄受伤
+    origHurt = P.hurt;
+    P.hurt = function (...args) {
+      if (cfg.god) {
+        this.invulnerable = Math.max(this.invulnerable || 0, 0.5);
+        return false;
+      }
+      return origHurt.apply(this, args);
+    };
+
+    // 一击必杀：只放大对敌人的伤害
+    origDamage = P.damage;
+    P.damage = function (target, amount, dir, knock) {
+      if (cfg.oneHit && target && target.kind !== 'hero' && amount > 0) {
+        amount *= 9999;
+      }
+      return origDamage.call(this, target, amount, dir, knock);
+    };
+
+    // 移动加速：模型会把 moveX/moveY 限制在 [-1,1]，这里在之后放大
+    origSetMove = P.setMove;
+    P.setMove = function (x, y) {
+      origSetMove.call(this, x, y);
+      if (cfg.speed) {
+        this.moveX *= 2;
+        this.moveY *= 2;
+      }
+    };
+
+    // 捕获当前战斗模型实例（不改变原方法行为）
+    const captureNames = ['hud', 'start', 'reset', 'configure', 'enterZone', 'snapshot', 'update'];
+    for (const name of captureNames) {
+      const original = P[name];
+      if (typeof original !== 'function') continue;
+      P[name] = function (...args) {
+        model = this;
+        window.__naiwaModel = this;
+        return original.apply(this, args);
+      };
+    }
+
+    setInterval(applyCheats, 50);
+    setTimeout(applyCheats, 0);
+  }
+
+  function hook() {
+    if (hooked) return Promise.resolve(true);
+    if (hookPromise) return hookPromise;
+
+    hookPromise = (async () => {
+      const src = findModuleUrl();
+      if (!src) {
+        hookError = '找不到游戏脚本';
+        return false;
+      }
+
+      try {
+        const mod = await import(src);
+        const candidates = Object.values(mod).filter(v =>
+          typeof v === 'function' &&
+          v.prototype &&
+          typeof v.prototype.hurt === 'function' &&
+          typeof v.prototype.damage === 'function' &&
+          typeof v.prototype.hud === 'function'
+        );
+        Model = candidates[0] || (mod && mod.B) || null;
+
+        if (!Model || !Model.prototype) {
+          hookError = '游戏模块结构不匹配';
+          return false;
+        }
+
+        // 找到游戏自己的清档函数（内部会同时清理缓存与带前缀的存档键）
+        try {
+          clearGameSave = Object.values(mod).find(v =>
+            typeof v === 'function' && /removeItem/.test(Function.prototype.toString.call(v))
+          ) || null;
+        } catch (e) { clearGameSave = null; }
+
+        install();
+        hooked = true;
+        hookError = '';
+        setState('已注入 · 点击「准备好出发」', 'ok');
+        return true;
+      } catch (e) {
+        hookError = String((e && e.message) || e);
+        console.warn(TAG, '注入失败：', e);
+        return false;
+      } finally {
+        hookPromise = null;
+      }
+    })();
+
+    return hookPromise;
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 作弊逻辑
+   * ------------------------------------------------------------------ */
+
+  function applyCheats() {
+    const m = getModel();
+    if (!m || !m.hero) {
+      updateInfo(null);
+      return;
+    }
+
+    const playing = m.phase === 'playing' && !m.paused;
+
+    if (playing) {
+      if (cfg.god) {
+        m.hero.hp = m.hero.maxHp;
+        m.invulnerable = Math.max(m.invulnerable || 0, 0.35);
+      }
+
+      if (cfg.energy) m.energy = 100;
+
+      if (cfg.superCharge) m.superCharge = 100;
+
+      if (cfg.dash) {
+        m.dashUnlocked = true;
+        m.dashCharges = m.maxDashCharges;
+        m.dashCooldown = 0;
+      }
+
+      if (cfg.peaches) m.peaches = Math.max(m.peaches || 0, 99);
+
+      if (cfg.autoAttack) {
+        const enemies = m.actors.filter(a => !a.dead && a.hp > 0);
+        if (enemies.length) {
+          enemies.sort((a, b) => {
+            const da = Math.hypot(a.x - m.hero.x, (a.y - m.hero.y) * 1.6);
+            const db = Math.hypot(b.x - m.hero.x, (b.y - m.hero.y) * 1.6);
+            return da - db;
+          });
+          const dx = enemies[0].x - m.hero.x;
+          if (Math.abs(dx) > 4) m.hero.face = Math.sign(dx);
+        }
+        if (m.canAct()) m.attack();
+      }
+    }
+
+    updateInfo(m);
+  }
+
+  function act(name) {
+    const m = getModel();
+    if (!m || !m.hero) {
+      toast('还没连上游戏，先点「准备好出发」吧');
+      return;
+    }
+
+    if (name === 'heal') {
+      m.hero.hp = m.hero.maxHp;
+      m.invulnerable = Math.max(m.invulnerable || 0, 1);
+      toast('生命值已回满');
+      return;
+    }
+
+    if (name === 'clear') {
+      const targets = m.actors.filter(a => !a.dead && a.hp > 0);
+      for (const a of targets) {
+        m.damage(a, a.maxHp * 10 + 999, 1, 0);
+      }
+      toast(targets.length ? `清屏：${targets.length} 个敌人` : '场上没有敌人');
+      return;
+    }
+
+    if (name === 'next') {
+      if (m.phase !== 'playing') {
+        toast('战斗中才能跳关');
+        return;
+      }
+      const next = Math.min(MAX_ZONE, m.zone + 1);
+      m.enterZone(next);
+      toast(`已跳到第 ${next + 1} 章`);
+      return;
+    }
+
+    if (name === 'final') {
+      if (m.phase !== 'playing') {
+        toast('战斗中才能跳关');
+        return;
+      }
+      m.enterZone(MAX_ZONE);
+      toast('已直达终章');
+      return;
+    }
+
+    if (name === 'reset') {
+      const ok = confirm('确定清除本机保存的当前进度吗？\n\n只会删除当前冒险存档（' + RUN_SAVE_FULL + '），不会影响游戏文件与最佳纪录。');
+      if (!ok) {
+        toast('已取消重置');
+        return;
+      }
+      m.paused = true;
+      // 关键：把 phase 改成不可存档状态，避免刷新时 pagehide 自动存档又把进度写回来
+      try { m.phase = 'title'; } catch (e) {}
+      // 优先用游戏自己的清档函数（会同时清掉内部缓存），再兜底直接删键
+      try { if (clearGameSave) clearGameSave(); } catch (e) {}
+      try {
+        localStorage.removeItem(RUN_SAVE_FULL);
+        localStorage.removeItem(RUN_SAVE_KEY); // 兼容旧版本/无前缀存档
+      } catch (e) {}
+      toast('已清除，正在刷新…');
+      setTimeout(() => location.reload(), 450);
+      return;
+    }
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 界面
+   * ------------------------------------------------------------------ */
+
+  let panel = null;
+  let fab = null;
+  let bodyEl = null;
+  let stateEl = null;
+  let dotEl = null;
+  let clockEl = null;
+  let hpEl = null;
+  let energyEl = null;
+  let zoneEl = null;
+  let bossEl = null;
+  let toastEl = null;
+  let toastTimer = 0;
+  let lastInfoAt = 0;
+  let drag = null;
+
+  const CSS = `
+    #nt-root, #nt-root * { box-sizing: border-box; }
+    #nt-root {
+      position: fixed; inset: 0; z-index: 2147483000;
+      pointer-events: none;
+      font-family: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    #nt-panel {
+      position: fixed; left: 14px; top: 14px;
+      width: 300px; max-width: calc(100vw - 24px);
+      max-height: calc(100vh - 24px);
+      display: flex; flex-direction: column;
+      color: #f8f0de;
+      background:
+        radial-gradient(160px 80px at 18% 0%, rgba(126,231,135,.13), transparent 72%),
+        linear-gradient(168deg, rgba(30,25,48,.975), rgba(12,10,22,.985));
+      border: 1px solid rgba(248,240,222,.16);
+      border-radius: 16px;
+      box-shadow: 0 26px 70px rgba(0,0,0,.6), inset 0 1px 0 rgba(255,255,255,.06);
+      pointer-events: auto;
+      overflow: hidden;
+      backdrop-filter: blur(14px);
+      animation: nt-in .18s ease-out;
+    }
+    #nt-panel.nt-hidden { display: none; }
+    @keyframes nt-in { from { opacity: 0; transform: translateY(8px) scale(.985); } }
+    #nt-head {
+      flex: none;
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 8px; padding: 11px 11px 8px;
+      cursor: grab; user-select: none; touch-action: none;
+    }
+    #nt-head.nt-dragging { cursor: grabbing; }
+    .nt-brand { display: flex; align-items: center; gap: 9px; min-width: 0; }
+    .nt-logo {
+      flex: none; width: 34px; height: 34px; border-radius: 10px;
+      display: grid; place-items: center; font-size: 19px; line-height: 1;
+      background: linear-gradient(145deg, #2f7042, #14301e);
+      border: 1px solid rgba(126,231,135,.36);
+      box-shadow: 0 4px 14px rgba(0,0,0,.4), inset 0 1px 0 rgba(255,255,255,.12);
+    }
+    .nt-brand b { display: block; font-size: 14px; font-weight: 700; letter-spacing: .02em; }
+    .nt-brand small {
+      display: block; margin-top: 1px; font-size: 8.5px; letter-spacing: .2em;
+      color: rgba(248,240,222,.42);
+    }
+    .nt-head-actions { display: flex; align-items: center; gap: 7px; }
+    .nt-dot {
+      width: 7px; height: 7px; border-radius: 50%;
+      background: #6b6478; box-shadow: 0 0 0 3px rgba(107,100,120,.14);
+      transition: .2s;
+    }
+    .nt-dot.ok {
+      background: #7ee787;
+      box-shadow: 0 0 0 3px rgba(126,231,135,.14), 0 0 11px rgba(126,231,135,.65);
+    }
+    .nt-dot.err {
+      background: #ff6b6b;
+      box-shadow: 0 0 0 3px rgba(255,107,107,.14), 0 0 11px rgba(255,107,107,.55);
+    }
+    .nt-min {
+      appearance: none; border: 0; width: 25px; height: 25px; border-radius: 7px;
+      background: rgba(255,255,255,.06); color: rgba(248,240,222,.7);
+      font-size: 15px; line-height: 1; cursor: pointer; padding: 0 0 3px;
+    }
+    .nt-min:hover { background: rgba(255,255,255,.12); color: #fff; }
+    #nt-body { overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; }
+    #nt-body::-webkit-scrollbar { width: 8px; }
+    #nt-body::-webkit-scrollbar-thumb { background: rgba(248,240,222,.16); border-radius: 8px; }
+    .nt-status {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0 12px 9px; font-size: 10.5px; color: rgba(248,240,222,.62);
+    }
+    #nt-state { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #nt-clock { font-variant-numeric: tabular-nums; color: rgba(248,240,222,.42); }
+    .nt-info {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 1px;
+      margin: 0 11px 11px; border-radius: 10px; overflow: hidden;
+      background: rgba(255,255,255,.055);
+    }
+    .nt-info > div { background: rgba(9,7,17,.6); padding: 6px 9px; min-width: 0; }
+    .nt-info small {
+      display: block; font-size: 8.5px; letter-spacing: .1em;
+      color: rgba(248,240,222,.4); margin-bottom: 1px;
+    }
+    .nt-info b {
+      display: block; font-size: 12px; font-weight: 600;
+      font-variant-numeric: tabular-nums; white-space: nowrap;
+      overflow: hidden; text-overflow: ellipsis;
+    }
+    .nt-section {
+      padding: 0 14px 5px; font-size: 8.5px; letter-spacing: .18em;
+      color: rgba(248,240,222,.34);
+    }
+    .nt-list { padding: 0 6px 7px; }
+    .nt-row {
+      display: flex; align-items: center; gap: 9px;
+      padding: 5px 6px; border-radius: 9px; cursor: pointer;
+      transition: background .12s;
+    }
+    .nt-row:hover { background: rgba(255,255,255,.045); }
+    .nt-switch { position: relative; flex: none; width: 38px; height: 22px; }
+    .nt-switch input {
+      position: absolute; inset: 0; width: 100%; height: 100%;
+      margin: 0; opacity: 0; cursor: pointer;
+    }
+    .nt-switch i {
+      position: absolute; inset: 0; border-radius: 22px;
+      background: #372f47; border: 1px solid rgba(255,255,255,.08);
+      transition: .16s; pointer-events: none;
+    }
+    .nt-switch i::after {
+      content: ""; position: absolute; top: 3px; left: 3px;
+      width: 14px; height: 14px; border-radius: 50%;
+      background: #bdb6c9; transition: .16s;
+    }
+    .nt-switch input:checked + i {
+      background: linear-gradient(90deg, #3f8f52, #7ee787);
+      border-color: rgba(126,231,135,.5);
+    }
+    .nt-switch input:checked + i::after {
+      transform: translateX(16px); background: #0f1a12;
+    }
+    .nt-text { min-width: 0; }
+    .nt-text b { display: block; font-size: 11.5px; font-weight: 600; }
+    .nt-text small {
+      display: block; font-size: 9px; color: rgba(248,240,222,.4);
+      margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .nt-actions {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 6px;
+      padding: 0 11px 9px;
+    }
+    .nt-actions button {
+      appearance: none; font-family: inherit; font-size: 10.5px;
+      padding: 6px 5px; border-radius: 8px; cursor: pointer;
+      color: #f8f0de; background: rgba(255,255,255,.05);
+      border: 1px solid rgba(248,240,222,.13);
+      transition: .12s; white-space: nowrap;
+    }
+    .nt-actions button:hover {
+      background: rgba(126,231,135,.14);
+      border-color: rgba(126,231,135,.36);
+    }
+    .nt-actions button:active { transform: translateY(1px); }
+    .nt-actions button.nt-danger { color: #ffb4b4; border-color: rgba(255,107,107,.22); }
+    .nt-actions button.nt-danger:hover { background: rgba(255,107,107,.14); }
+    .nt-foot {
+      padding: 6px 12px 8px; text-align: center; font-size: 8.5px;
+      color: rgba(248,240,222,.28);
+      border-top: 1px solid rgba(255,255,255,.055);
+    }
+    #nt-fab {
+      position: fixed; left: 12px; top: 42%;
+      min-width: 46px; height: 46px; padding: 0 12px;
+      border-radius: 14px;
+      display: none; align-items: center; justify-content: center; gap: 6px;
+      font-size: 20px; line-height: 1; cursor: pointer;
+      color: #d9ffd0;
+      background: linear-gradient(145deg, #2f7042, #122619);
+      border: 1px solid rgba(126,231,135,.4);
+      box-shadow: 0 10px 30px rgba(0,0,0,.5), inset 0 1px 0 rgba(255,255,255,.14);
+      pointer-events: auto;
+    }
+    #nt-fab::after {
+      content: "修改器"; font-size: 11px; font-weight: 600; letter-spacing: .04em;
+      font-family: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    }
+    #nt-fab.nt-show { display: flex; }
+    #nt-fab:active { transform: scale(.96); }
+    #nt-toast {
+      position: absolute; left: 50%; bottom: 10px;
+      transform: translateX(-50%) translateY(4px);
+      max-width: calc(100% - 24px);
+      padding: 5px 11px; border-radius: 99px;
+      font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      color: #d9ffd0; background: rgba(9,7,17,.95);
+      border: 1px solid rgba(126,231,135,.3);
+      opacity: 0; pointer-events: none;
+      transition: opacity .18s, transform .18s;
+    }
+    #nt-toast.nt-show { opacity: 1; transform: translateX(-50%) translateY(0); }
+    @media (max-width: 420px) {
+      #nt-panel { width: calc(100vw - 24px); }
+    }
+    /* 手机横屏 / 小窗口：压缩面板，保证一屏能看到更多开关 */
+    @media (max-height: 560px), (max-width: 700px) {
+      #nt-panel { width: 280px; max-width: calc(100vw - 20px); max-height: calc(100vh - 16px); }
+      #nt-head { padding: 8px 9px 6px; }
+      .nt-logo { width: 30px; height: 30px; font-size: 17px; border-radius: 9px; }
+      .nt-brand b { font-size: 13px; }
+      .nt-brand small { display: none; }
+      .nt-min { width: 30px; height: 30px; font-size: 16px; }
+      .nt-status { padding: 0 10px 6px; font-size: 10px; }
+      .nt-info { margin: 0 9px 8px; }
+      .nt-info > div { padding: 4px 7px; }
+      .nt-info b { font-size: 11px; }
+      .nt-section { padding: 0 11px 4px; }
+      .nt-list { padding: 0 5px 5px; }
+      .nt-row { padding: 3px 5px; gap: 8px; }
+      .nt-text b { font-size: 11px; }
+      .nt-text small { display: none; }
+      .nt-actions { padding: 0 9px 7px; gap: 5px; }
+      .nt-actions button { padding: 5px 4px; font-size: 10px; }
+      .nt-foot { display: none; }
+    }
+    @media (pointer: coarse) {
+      #nt-fab { height: 50px; min-width: 50px; font-size: 22px; }
+      .nt-row { min-height: 34px; }
+      .nt-actions button { min-height: 34px; }
+    }
+  `;
+
+  function buildUI() {
+    const root = document.createElement('div');
+    root.id = 'nt-root';
+
+    const style = document.createElement('style');
+    style.id = 'nt-style';
+    style.textContent = CSS;
+    document.head.appendChild(style);
+
+    panel = document.createElement('div');
+    panel.id = 'nt-panel';
+    panel.innerHTML = `
+      <div id="nt-head">
+        <div class="nt-brand">
+          <span class="nt-logo">🐸</span>
+          <div><b>奶蛙修改器</b><small>NAIWA TRAINER</small></div>
+        </div>
+        <div class="nt-head-actions">
+          <span class="nt-dot" id="nt-dot"></span>
+          <button class="nt-min" id="nt-min" title="收起面板">—</button>
+        </div>
+      </div>
+      <div id="nt-body">
+        <div class="nt-status">
+          <span id="nt-state">正在连接游戏…</span>
+          <span id="nt-clock">00:00</span>
+        </div>
+        <div class="nt-info">
+          <div><small>生命</small><b id="nt-hp">—</b></div>
+          <div><small>能量</small><b id="nt-energy">—</b></div>
+          <div><small>章节</small><b id="nt-zone">—</b></div>
+          <div><small>首领</small><b id="nt-boss">—</b></div>
+        </div>
+        <div class="nt-section">作弊开关</div>
+        <div class="nt-list" id="nt-list"></div>
+        <div class="nt-section">快捷操作</div>
+        <div class="nt-actions">
+          <button data-act="heal">回满血</button>
+          <button data-act="clear">清屏秒杀</button>
+          <button data-act="next">下一章</button>
+          <button data-act="final">直达终章</button>
+          <button data-act="hide">隐藏面板</button>
+          <button data-act="reset" class="nt-danger">重置存档</button>
+        </div>
+        <div class="nt-foot">Alt+M 显示 / 隐藏 · 设置会自动保存</div>
+      </div>
+      <div id="nt-toast"></div>
+    `;
+
+    fab = document.createElement('button');
+    fab.id = 'nt-fab';
+    fab.title = '打开奶蛙修改器';
+    fab.textContent = '🐸';
+
+    root.appendChild(panel);
+    root.appendChild(fab);
+    document.body.appendChild(root);
+
+    stateEl = document.getElementById('nt-state');
+    dotEl = document.getElementById('nt-dot');
+    clockEl = document.getElementById('nt-clock');
+    hpEl = document.getElementById('nt-hp');
+    energyEl = document.getElementById('nt-energy');
+    zoneEl = document.getElementById('nt-zone');
+    bossEl = document.getElementById('nt-boss');
+    toastEl = document.getElementById('nt-toast');
+    bodyEl = document.getElementById('nt-body');
+
+    const list = document.getElementById('nt-list');
+    for (const [key, title, desc] of TOGGLES) {
+      const row = document.createElement('label');
+      row.className = 'nt-row';
+      row.dataset.key = key;
+      row.title = desc;
+      row.innerHTML = `
+        <span class="nt-switch"><input type="checkbox"><i></i></span>
+        <span class="nt-text"><b></b><small></small></span>
+      `;
+      row.querySelector('b').textContent = title;
+      row.querySelector('small').textContent = desc;
+      list.appendChild(row);
+    }
+
+    syncUI();
+    bindUI();
+    restorePosition();
+    setPanel(cfg.panel !== false);
+  }
+
+  function bindUI() {
+    const head = document.getElementById('nt-head');
+
+    document.getElementById('nt-min').addEventListener('click', e => {
+      e.stopPropagation();
+      setPanel(false);
+    });
+
+    fab.addEventListener('click', () => setPanel(true));
+
+    panel.addEventListener('click', e => {
+      const btn = e.target.closest('button[data-act]');
+      if (btn) {
+        e.preventDefault();
+        e.stopPropagation();
+        act(btn.dataset.act);
+      }
+    });
+
+    document.getElementById('nt-list').addEventListener('change', e => {
+      const input = e.target;
+      if (!input || input.type !== 'checkbox') return;
+      const row = input.closest('.nt-row');
+      if (!row) return;
+      const key = row.dataset.key;
+      cfg[key] = !!input.checked;
+      saveCfg();
+      const label = TOGGLES.find(t => t[0] === key);
+      toast(`${input.checked ? '已开启' : '已关闭'}：${label ? label[1] : key}`);
+    });
+
+    // 拖动面板
+    head.addEventListener('pointerdown', e => {
+      if (e.target.closest('button')) return;
+      e.preventDefault();
+      const rect = panel.getBoundingClientRect();
+      drag = {
+        dx: e.clientX - rect.left,
+        dy: e.clientY - rect.top,
+        w: rect.width,
+        h: rect.height,
+        id: e.pointerId
+      };
+      head.classList.add('nt-dragging');
+      try { head.setPointerCapture(e.pointerId); } catch (err) {}
+    });
+
+    head.addEventListener('pointermove', e => {
+      if (!drag) return;
+      const maxX = window.innerWidth - drag.w - 6;
+      const maxY = window.innerHeight - drag.h - 6;
+      const x = Math.max(6, Math.min(maxX, e.clientX - drag.dx));
+      const y = Math.max(6, Math.min(maxY, e.clientY - drag.dy));
+      panel.style.left = x + 'px';
+      panel.style.top = y + 'px';
+      panel.style.bottom = 'auto';
+    });
+
+    const endDrag = () => {
+      if (!drag) return;
+      drag = null;
+      head.classList.remove('nt-dragging');
+      cfg.x = panel.offsetLeft;
+      cfg.y = panel.offsetTop;
+      saveCfg();
+    };
+    head.addEventListener('pointerup', endDrag);
+    head.addEventListener('pointercancel', endDrag);
+
+    // 阻止面板上的指针事件传给游戏
+    for (const type of ['pointerdown', 'pointermove', 'pointerup', 'touchstart', 'touchmove', 'touchend', 'wheel']) {
+      panel.addEventListener(type, e => e.stopPropagation(), { passive: true });
+    }
+
+    window.addEventListener('resize', () => {
+      if (!panel || panel.classList.contains('nt-hidden')) return;
+      const rect = panel.getBoundingClientRect();
+      const x = Math.max(6, Math.min(window.innerWidth - rect.width - 6, rect.left));
+      const y = Math.max(6, Math.min(window.innerHeight - rect.height - 6, rect.top));
+      panel.style.left = x + 'px';
+      panel.style.top = y + 'px';
+      panel.style.bottom = 'auto';
+    });
+
+    // 快捷键：Alt + M / 1-8
+    window.addEventListener('keydown', e => {
+      if (!e.altKey || e.ctrlKey || e.metaKey) return;
+      if (e.code === 'KeyM') {
+        e.preventDefault();
+        e.stopPropagation();
+        setPanel(panel.classList.contains('nt-hidden'));
+        return;
+      }
+      const idx = ['Digit1', 'Digit2', 'Digit3', 'Digit4', 'Digit5', 'Digit6', 'Digit7', 'Digit8'].indexOf(e.code);
+      if (idx >= 0 && idx < TOGGLES.length) {
+        e.preventDefault();
+        e.stopPropagation();
+        const key = TOGGLES[idx][0];
+        setToggle(key, !cfg[key]);
+        toast(`${cfg[key] ? '已开启' : '已关闭'}：${TOGGLES[idx][1]}`);
+      }
+    }, true);
+  }
+
+  function setToggle(key, value) {
+    cfg[key] = !!value;
+    saveCfg();
+    syncUI();
+  }
+
+  function syncUI() {
+    const rows = document.querySelectorAll('#nt-list .nt-row');
+    for (const row of rows) {
+      const input = row.querySelector('input');
+      if (input) input.checked = !!cfg[row.dataset.key];
+    }
+  }
+
+  function setPanel(show) {
+    cfg.panel = !!show;
+    saveCfg();
+    if (!panel) return;
+    panel.classList.toggle('nt-hidden', !show);
+    fab.classList.toggle('nt-show', !show);
+    if (show) {
+      updateInfo(getModel());
+      syncUI();
+    }
+  }
+
+  function restorePosition() {
+    if (Number.isFinite(cfg.x) && Number.isFinite(cfg.y)) {
+      requestAnimationFrame(() => {
+        if (!panel) return;
+        const rect = panel.getBoundingClientRect();
+        const x = Math.max(6, Math.min(window.innerWidth - rect.width - 6, cfg.x));
+        const y = Math.max(6, Math.min(window.innerHeight - rect.height - 6, cfg.y));
+        panel.style.left = x + 'px';
+        panel.style.top = y + 'px';
+        panel.style.bottom = 'auto';
+      });
+    }
+  }
+
+  function setState(text, kind) {
+    if (!stateEl) return;
+    stateEl.textContent = text;
+    if (dotEl) {
+      dotEl.classList.toggle('ok', kind === 'ok');
+      dotEl.classList.toggle('err', kind === 'err');
+    }
+  }
+
+  function fmtTime(seconds) {
+    const s = Math.max(0, Math.floor(seconds || 0));
+    return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
+  }
+
+  function updateInfo(m) {
+    if (!panel || panel.classList.contains('nt-hidden')) return;
+    const now = performance.now();
+    if (now - lastInfoAt < 150) return;
+    lastInfoAt = now;
+
+    if (!m || !m.hero) {
+      hpEl.textContent = '—';
+      energyEl.textContent = '—';
+      zoneEl.textContent = '—';
+      bossEl.textContent = '—';
+      clockEl.textContent = '00:00';
+      if (hooked) setState('已注入 · 等待开局', 'ok');
+      else if (hookError) setState('连接失败：' + hookError, 'err');
+      else setState('正在连接游戏…', '');
+      return;
+    }
+
+    const boss = m.actors.find(a =>
+      !a.dead && ['boss', 'captain', 'general', 'marshal'].includes(a.kind)
+    );
+
+    hpEl.textContent = `${Math.ceil(m.hero.hp)} / ${m.hero.maxHp}`;
+    energyEl.textContent = `${Math.floor(m.energy)}%`;
+    zoneEl.textContent = `${m.zone + 1} / ${MAX_ZONE + 1} 章`;
+    bossEl.textContent = boss ? `${Math.ceil(Math.max(0, boss.hp))} / ${boss.maxHp}` : '—';
+    clockEl.textContent = fmtTime(m.elapsed);
+    setState(PHASE_TEXT[m.phase] || m.phase, 'ok');
+  }
+
+  function toast(message) {
+    if (!toastEl) return;
+    toastEl.textContent = message;
+    toastEl.classList.add('nt-show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => toastEl.classList.remove('nt-show'), 1700);
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 启动
+   * ------------------------------------------------------------------ */
+
+  async function boot() {
+    if (!document.body) return;
+    try {
+      buildUI();
+    } catch (e) {
+      console.error(TAG, '界面创建失败：', e);
+      return;
+    }
+
+    const ok = await hook();
+    if (ok) return;
+
+    setState('正在等待游戏脚本…', '');
+    let tries = 0;
+    const timer = setInterval(async () => {
+      tries++;
+      const success = await hook();
+      if (success || tries >= 20) {
+        clearInterval(timer);
+        if (!success) setState('连接失败：' + (hookError || '请刷新页面'), 'err');
+      }
+    }, 1200);
+  }
+
+  window.__NAIWA_TRAINER__ = {
+    get config() { return cfg; },
+    get model() { return getModel(); },
+    get Model() { return Model; },
+    set: setToggle,
+    show: () => setPanel(true),
+    hide: () => setPanel(false),
+    toast
+  };
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot, { once: true });
+  } else {
+    setTimeout(boot, 0);
+  }
+})();
+
+  </script>
+</body>
+</html>
